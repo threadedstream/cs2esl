@@ -3,6 +3,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import io
 import soundfile as sf
+import torch
+import numpy as np
+
+torch.serialization.add_safe_globals([
+    np.core.multiarray.scalar,
+    np.ndarray,
+    np.dtype,
+])
+
 from bark import generate_audio, preload_models
 
 app = FastAPI()
