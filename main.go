@@ -8,11 +8,15 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/exec"
 	"sync"
 	"time"
 )
 
-// --------- Domain model (your events) ---------
+var (
+	speechQueue = make(chan string, 10) // buffered queue
+)
 
 type Cs2EventType string
 
@@ -33,7 +37,9 @@ type Cs2Event struct {
 	Metadata  map[string]any `json:"metadata,omitempty"`
 }
 
-// --------- GSI payload (subset of real schema) ---------
+/* =========================
+   GSI payload (subset)
+========================= */
 
 type GsiPayload struct {
 	Map struct {
@@ -41,31 +47,22 @@ type GsiPayload struct {
 	} `json:"map"`
 
 	Round struct {
-		Phase   string `json:"phase"` // e.g. "freezetime", "live", "over"
+		Phase   string `json:"phase"`
 		WinTeam string `json:"win_team,omitempty"`
 	} `json:"round"`
 
 	Player struct {
-		Name  string `json:"name"`
-		Team  string `json:"team"`
-		State struct {
-			Health      int  `json:"health"`
-			Armor       int  `json:"armor"`
-			Helmet      bool `json:"helmet"`
-			RoundKills  int  `json:"round_kills"`
-			RoundKillHS int  `json:"round_killhs"`
-		} `json:"state"`
+		Name       string `json:"name"`
 		MatchStats struct {
-			Kills   int `json:"kills"`
-			Assists int `json:"assists"`
-			Deaths  int `json:"deaths"`
-			Mvps    int `json:"mvps"`
-			Score   int `json:"score"`
+			Kills  int `json:"kills"`
+			Deaths int `json:"deaths"`
 		} `json:"match_stats"`
 	} `json:"player"`
 }
 
-// --------- Event processor (sliding window) ---------
+/* =========================
+   Event processor
+========================= */
 
 type EventProcessor struct {
 	mu     sync.Mutex
@@ -80,7 +77,7 @@ func NewEventProcessor(maxLen int) *EventProcessor {
 	}
 }
 
-func (p *EventProcessor) AddEvent(evt Cs2Event) {
+func (p *EventProcessor) Add(evt Cs2Event) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -99,8 +96,6 @@ func (p *EventProcessor) Snapshot() []Cs2Event {
 	return out
 }
 
-// --------- LLM integration (real OpenAI HTTP) ---------
-
 type openAIChatRequest struct {
 	Model    string              `json:"model"`
 	Messages []openAIChatMessage `json:"messages"`
@@ -117,30 +112,73 @@ type openAIChatResponse struct {
 	} `json:"choices"`
 }
 
-type LlmResponse struct {
-	Commentary string `json:"commentary"`
-}
+func callLLM(ctx context.Context, events []Cs2Event) (string, error) {
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("OPENAI_API_KEY not set")
+	}
 
-func callLlm(ctx context.Context, events []Cs2Event) (LlmResponse, error) {
 	eventsJSON, _ := json.Marshal(events)
 
-	prompt := fmt.Sprintf(`
-You are an ESL-style Counter-Strike 2 commentator.
-Be energetic, concise, and analytical.
-React to the following events in real time.
+	systemPrompt := `
+You are an ESL Counter-Strike play-by-play commentator.
+
+ABSOLUTE RULES:
+- NEVER explain the game.
+- NEVER narrate like a recap.
+- NEVER start with map names, player names, or round context.
+- NEVER sound neutral.
+
+STYLE:
+- Speak like the action is unfolding RIGHT NOW.
+- Assume the listener already understands CS.
+- Compress meaning aggressively.
+- Every word must earn its place.
+
+DELIVERY:
+- Short bursts.
+- Controlled hype.
+- Sentence fragments are allowed.
+- Silence is better than filler.
+
+FORMAT:
+- 1 sentence for live action.
+- 2 sentences max for round end.
+- 6–12 words per sentence.
+
+GOAL:
+Sound like an ESL caster calling a live match, not an analyst.
+
+Use ESL-style phrasing such as:
+- "cracks it wide open"
+- "no room to breathe"
+- "dictating the pace"
+- "isolates the fight"
+- "this round is done"
+But never quote them verbatim every time.
+`
+
+	userPrompt := fmt.Sprintf(`
+Think in terms of:
+- pressure
+- timing
+- spacing
+- isolation
+- initiative
 
 Events JSON:
 %s
 
-If map's name starts with de_, ignore it. For example, if it's de_Mirage, call it Mirage
+If map name starts with de_, drop the prefix.
 Give hype commentary.
-Max 2 sentences.
 `, string(eventsJSON))
 
-	reqBody := map[string]any{
-		"model":  "llama3.1:8b",
-		"prompt": prompt,
-		"stream": false,
+	reqBody := openAIChatRequest{
+		Model: "gpt-4.1-mini",
+		Messages: []openAIChatMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
 	}
 
 	body, _ := json.Marshal(reqBody)
@@ -148,191 +186,180 @@ Max 2 sentences.
 	req, err := http.NewRequestWithContext(
 		ctx,
 		"POST",
-		"http://127.0.0.1:11434/api/generate",
+		"https://api.openai.com/v1/chat/completions",
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return LlmResponse{}, err
+		return "", err
 	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return LlmResponse{}, err
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	var ollamaResp struct {
-		Response string `json:"response"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&ollamaResp); err != nil {
-		return LlmResponse{}, err
+	var out openAIChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
 	}
 
-	return LlmResponse{Commentary: ollamaResp.Response}, nil
+	if len(out.Choices) == 0 {
+		return "", fmt.Errorf("no LLM output")
+	}
+
+	return out.Choices[0].Message.Content, nil
 }
 
-// --------- Global state: previous GSI snapshot & latest commentary ---------
-
-var (
-	processor = NewEventProcessor(20)
-	prevGsiMu sync.Mutex
-	prevGsi   *GsiPayload
-)
-
-// --------- GSI handler: real integration with CS2 ---------
-
-func handleGsi(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
-	}
-
-	defer r.Body.Close()
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read error", http.StatusBadRequest)
-		return
-	}
-
-	var payload GsiPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		log.Printf("Failed to parse GSI JSON: %v\nBody: %s\n", err, string(body))
-		http.Error(w, "bad json", http.StatusBadRequest)
-		return
-	}
-
-	now := time.Now()
-	mapName := payload.Map.Name
-	playerName := payload.Player.Name
-
-	events := diffGsiToEvents(&payload, now, mapName, playerName)
-	for _, evt := range events {
-		processor.AddEvent(evt)
-		log.Printf("Event detected: %+v\n", evt)
-	}
-
-	// Respond quickly; CS2 doesn't care about body, just status.
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// diffGsiToEvents looks at previous payload vs current and emits logical events.
-func diffGsiToEvents(curr *GsiPayload, now time.Time, mapName, playerName string) []Cs2Event {
-	prevGsiMu.Lock()
-	defer prevGsiMu.Unlock()
-
-	var out []Cs2Event
-
-	// If no previous snapshot -> maybe just detect round start if live
-	if prevGsi == nil {
-		if curr.Round.Phase == "live" {
-			out = append(out, Cs2Event{
-				Type:      EventRoundStart,
-				Player:    playerName,
-				Map:       mapName,
-				Timestamp: now,
-				Metadata: map[string]any{
-					"phase": "live",
-				},
-			})
-		}
-		prevGsi = curr
-		return out
-	}
-
-	// Round phase changes
-	if curr.Round.Phase != prevGsi.Round.Phase {
-		switch curr.Round.Phase {
-		case "live":
-			out = append(out, Cs2Event{
-				Type:      EventRoundStart,
-				Player:    playerName,
-				Map:       mapName,
-				Timestamp: now,
-				Metadata: map[string]any{
-					"prev_phase": prevGsi.Round.Phase,
-				},
-			})
-		case "over":
-			out = append(out, Cs2Event{
-				Type:      EventRoundEnd,
-				Player:    playerName,
-				Map:       mapName,
-				Timestamp: now,
-				Metadata: map[string]any{
-					"winner":     curr.Round.WinTeam,
-					"prev_phase": prevGsi.Round.Phase,
-				},
-			})
-		}
-	}
-
-	// Match stats kill/death deltas
-	dKills := curr.Player.MatchStats.Kills - prevGsi.Player.MatchStats.Kills
-	dDeaths := curr.Player.MatchStats.Deaths - prevGsi.Player.MatchStats.Deaths
-
-	for i := 0; i < dKills; i++ {
-		out = append(out, Cs2Event{
-			Type:      EventKill,
-			Player:    playerName,
-			Map:       mapName,
-			Timestamp: now,
-			Metadata: map[string]any{
-				"total_kills": curr.Player.MatchStats.Kills,
-			},
-		})
-	}
-
-	for i := 0; i < dDeaths; i++ {
-		out = append(out, Cs2Event{
-			Type:      EventDeath,
-			Player:    playerName,
-			Map:       mapName,
-			Timestamp: now,
-			Metadata: map[string]any{
-				"total_deaths": curr.Player.MatchStats.Deaths,
-			},
-		})
-	}
-
-	// Save current as previous for next diff
-	prevGsi = curr
-	return out
-}
-
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Background goroutine: periodically send recent events to LLM
+func startSpeechWorker(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				events := processor.Snapshot()
-				if len(events) == 0 {
-					continue
+			case text := <-speechQueue:
+				// Block until speech finishes
+				if err := speak(ctx, text); err != nil {
+					log.Println("TTS error:", err)
 				}
+			}
+		}
+	}()
+}
 
-				resp, err := callLlm(ctx, events)
-				if err != nil {
-					log.Printf("LLM error: %v\n", err)
-					continue
-				}
-				log.Printf("LLM commentary: %s\n", resp.Commentary)
+func speak(ctx context.Context, text string) error {
+	apiKey := os.Getenv("OPENAI_API_KEY")
+
+	reqBody := map[string]any{
+		"model": "gpt-4o-mini-tts",
+		"voice": "alloy",
+		"input": text,
+	}
+
+	body, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		"https://api.openai.com/v1/audio/speech",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	cmd := exec.Command(
+		"ffplay",
+		"-autoexit",
+		"-nodisp",
+		"-af", "atempo=1.38,volume=1.1",
+		"-",
+	)
+	cmd.Stdin = resp.Body
+	return cmd.Run()
+}
+
+/* =========================
+   Global state
+========================= */
+
+var (
+	processor = NewEventProcessor(15)
+	prevMu    sync.Mutex
+	prevGsi   *GsiPayload
+)
+
+/* =========================
+   GSI handler
+========================= */
+
+func handleGsi(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	body, _ := io.ReadAll(r.Body)
+
+	var payload GsiPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		w.WriteHeader(400)
+		return
+	}
+
+	now := time.Now()
+	player := payload.Player.Name
+	mapName := payload.Map.Name
+
+	prevMu.Lock()
+	defer prevMu.Unlock()
+
+	if prevGsi != nil {
+		if payload.Player.MatchStats.Kills > prevGsi.Player.MatchStats.Kills {
+			processor.Add(Cs2Event{
+				Type:      EventKill,
+				Player:    player,
+				Map:       mapName,
+				Timestamp: now,
+			})
+		}
+		if payload.Player.MatchStats.Deaths > prevGsi.Player.MatchStats.Deaths {
+			processor.Add(Cs2Event{
+				Type:      EventDeath,
+				Player:    player,
+				Map:       mapName,
+				Timestamp: now,
+			})
+		}
+	}
+
+	prevGsi = &payload
+	w.WriteHeader(204)
+}
+
+func main() {
+	ctx := context.Background()
+
+	startSpeechWorker(ctx)
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			events := processor.Snapshot()
+			if len(events) == 0 {
+				continue
+			}
+
+			text, err := callLLM(ctx, events)
+			if err != nil {
+				log.Println("LLM error:", err)
+				continue
+			}
+
+			log.Println("Commentary:", text)
+
+			select {
+			case speechQueue <- text:
+				// queued successfully
+			default:
+				// queue full → drop commentary (prevents lag buildup)
+				log.Println("Speech queue full, dropping commentary")
 			}
 		}
 	}()
 
 	http.HandleFunc("/cs2-gsi", handleGsi)
 
-	addr := ":8080"
-	log.Printf("Listening on %s (GSI endpoint: http://127.0.0.1%s/cs2-gsi)", addr, addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatal(err)
-	}
+	log.Println("Listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
